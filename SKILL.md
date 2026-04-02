@@ -64,8 +64,35 @@ pip install python-hwpx lxml --break-system-packages
  ├─ "이 HWPX 양식으로 만들어줘" → 워크플로우 D (레퍼런스 기반)
  ├─ "이 양식 복제해서 내용 바꿔줘" → 워크플로우 F (양식 복제) ★
  ├─ "공문 작성해줘/공문서 검수해줘" → 워크플로우 G (공문서 작성법 준수) ★
- └─ "HWPX 읽어줘" → 워크플로우 E (읽기/추출)
+ ├─ "HWPX 읽어줘" → 워크플로우 E (읽기/추출)
+ └─ ".hwp 파일 변환해줘" → 워크플로우 H (HWP 바이너리 변환) ★
 ```
+
+### ⚠️ .hwp 바이너리 파일 대응 (워크플로우 H)
+
+> `.hwpx`(XML 기반)가 아닌 구형 `.hwp`(바이너리) 파일이 입력된 경우의 처리.
+> 발주처가 `.hwp`로 양식을 줄 때 대응.
+
+**판별**: 파일 확장자가 `.hwp`이면 자동 진입.
+
+**변환 플로우**:
+```
+[1차] k-skill HWP 모듈 (NomaDamas/k-skill) — 설치 시
+  python -m k_skill.hwp convert [파일경로] --format json
+  → .hwp → JSON/Markdown/HTML 변환
+  → 변환된 내용으로 워크플로우 A~F 중 적합한 것 진행
+
+[2차] python-hwp5 패키지 — k-skill 미설치 시
+  pip install hwp5 --break-system-packages
+  hwp5txt [파일경로] > output.txt
+  → 텍스트 추출 후 워크플로우 A로 진행 (서식 손실 있음)
+
+[3차] 수동 변환 안내 — 패키지 모두 실패 시
+  "이 파일은 .hwp(바이너리) 형식입니다.
+   한글에서 열어 '다른 이름으로 저장 → .hwpx'로 변환 후 다시 시도해주세요."
+```
+
+**참고**: k-skill HWP 모듈은 `pip install k-skill-hwp`로 설치. 상세: https://github.com/NomaDamas/k-skill
 
 ### ⚠️ 자동 판별 규칙 (사용자가 양식 파일을 제공한 경우)
 
