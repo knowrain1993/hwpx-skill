@@ -5,10 +5,12 @@ HWPX 양식 복제 도구 (Workflow F)
 기존 HWPX 양식을 복사한 뒤 텍스트만 치환하여 새 문서를 생성한다.
 원본의 테이블·이미지·스타일을 100% 유지하면서 내용만 교체한다.
 
-3단계 치환:
+4단계 치환:
   Phase 1 — 구문 수준(--map/--replace): 전체 XML에서 긴 문구를 먼저 치환
   Phase 2 — 키워드 수준(--keywords): <hp:t> 태그 내부에서만 남은 키워드를 치환
   Phase L — 장문 삽입(--long-map): lxml로 <hp:p> 복제하여 긴 텍스트를 문단 분할 삽입
+  Phase L+ — 빨간 가이드 스윕: 남은 #FF0000 run의 텍스트를 비우고 리포트 생성
+           (기본 활성, --no-sweep-red로 비활성)
 
 사용법:
   분석:    python clone_form.py --analyze sample.hwpx
@@ -419,6 +421,7 @@ def _apply_long_map(xml_bytes, long_map):
 
     root = etree.fromstring(xml_bytes)
     total_inserted = 0
+    per_anchor = {}  # {section_title: inserted_count} — 미매칭 탐지용
 
     for section_title, config in long_map.items():
         if isinstance(config, list):
@@ -433,12 +436,229 @@ def _apply_long_map(xml_bytes, long_map):
         if count > 0:
             print(f"  Phase L: [{section_title}] {count}개 문단 삽입")
         total_inserted += count
+        per_anchor[section_title] = count
 
     # 전체 linesegarray 최종 정리
     _remove_all_linesegarray(root)
 
     result = etree.tostring(root, encoding="unicode", xml_declaration=False)
-    return xml_decl + result, total_inserted
+    return xml_decl + result, total_inserted, per_anchor
+
+
+# ---------------------------------------------------------------------------
+# Phase L+ : 빨간 가이드 스윕 (template 가이드 문구 자동 제거)
+# ---------------------------------------------------------------------------
+
+_RED_COLOR_TOKENS = {"#FF0000", "FF0000", "#F00", "F00"}
+
+# Phase L+ 빈 문단 판정 시 "의미 없는 잔해"로 간주할 문자들
+# (불릿 기호·공백·조판 기호 — 이것만 남으면 문단이 텅 빈 것으로 본다)
+_BULLET_ONLY_CHARS = set("\u318d\u00b7\u2022\u25cf\u25cb-\u2014\u2013\u2212 \t\n\u00a0\u3000")
+
+
+# 표 셀·머리말/꼬리말 등 구조 컨테이너 — 이 안쪽 문단은 제거하지 않음
+_PROTECTED_CONTAINER_LOCALNAMES = {
+    "tc", "cell",           # 표 셀
+    "header", "footer",     # 머리말/꼬리말
+    "footnote", "endnote",  # 각주/미주
+    "textbox", "shape",     # 텍스트박스·도형 안쪽 (구조 유지 우선)
+}
+
+
+def _is_bullet_only_paragraph(p_element, t_tag):
+    """문단 내 모든 <hp:t> 텍스트를 concat했을 때 ㆍ/공백/불릿기호만 남는지 판정.
+
+    linesegarray 같은 자식은 무시. 실제 텍스트만 본다.
+    """
+    all_text = []
+    for t in p_element.iter(t_tag):
+        if t.text:
+            all_text.append(t.text)
+    combined = "".join(all_text)
+    if not combined:
+        return True  # 완전히 비었으면 제거 대상
+    # 공백/불릿 문자만 있으면 True
+    return all(ch in _BULLET_ONLY_CHARS for ch in combined)
+
+
+def _is_inside_protected_container(p_element):
+    """문단이 표 셀·머리말/꼬리말 등 구조 컨테이너 안에 있는지 확인."""
+    node = p_element.getparent()
+    while node is not None:
+        localname = etree.QName(node.tag).localname
+        if localname in _PROTECTED_CONTAINER_LOCALNAMES:
+            return True
+        node = node.getparent()
+    return False
+
+
+def _collect_red_char_pr_ids(header_xml_bytes):
+    """header.xml에서 textColor가 #FF0000인 charPr id 목록을 수집한다.
+
+    Returns:
+        set[str]: 빨간색 charPr id 집합. 없으면 빈 set.
+    """
+    try:
+        parser = etree.XMLParser(remove_blank_text=False, ns_clean=False)
+        root = etree.fromstring(header_xml_bytes, parser=parser)
+    except etree.XMLSyntaxError:
+        return set()
+
+    HH_NS = "http://www.hancom.co.kr/hwpml/2011/head"
+    ids = set()
+    for cp in root.iter(f"{{{HH_NS}}}charPr"):
+        color = cp.get("textColor") or cp.get("textcolor")
+        if color and color.upper() in _RED_COLOR_TOKENS:
+            cp_id = cp.get("id")
+            if cp_id:
+                ids.add(cp_id)
+    return ids
+
+
+def _sweep_red_guides(section_xml_bytes, red_ids, allow_texts=None):
+    """section XML에서 빨간 charPr을 참조하는 run의 <hh:t> 텍스트를 비운다.
+
+    run 자체는 제거하지 않는다 (문단 번호·스타일 보존). 텍스트만 비우고
+    linesegarray를 제거하여 한컴이 줄 배치를 재계산하게 한다.
+
+    Args:
+        section_xml_bytes: section XML (bytes)
+        red_ids: 빨간 charPr id 집합
+        allow_texts: 삭제하지 않을 예외 문자열 리스트 (본문 강조용 빨간 텍스트)
+
+    Returns:
+        (xml_bytes, report): 처리된 XML과 삭제 로그 dict 리스트
+    """
+    if not red_ids:
+        return section_xml_bytes, []
+
+    allow_set = set(allow_texts or [])
+
+    try:
+        parser = etree.XMLParser(remove_blank_text=False, ns_clean=False)
+        root = etree.fromstring(section_xml_bytes, parser=parser)
+    except etree.XMLSyntaxError:
+        return section_xml_bytes, []
+
+    HP_NS = "http://www.hancom.co.kr/hwpml/2011/paragraph"
+    run_tag = f"{{{HP_NS}}}run"
+    t_tag = f"{{{HP_NS}}}t"
+
+    report = []
+    affected_parents = set()
+
+    for run in root.iter(run_tag):
+        ref = run.get("charPrIDRef")
+        if ref not in red_ids:
+            continue
+        # 이 run 안의 모든 <hh:t> 수집
+        t_elements = list(run.iter(t_tag))
+        if not t_elements:
+            continue
+        # 텍스트 취합 (로그용)
+        combined = "".join((t.text or "") for t in t_elements).strip()
+        if not combined:
+            continue
+        if combined in allow_set:
+            continue
+        # 삭제 수행: 텍스트만 비움 (run·문단 구조는 유지)
+        for t in t_elements:
+            t.text = ""
+        report.append({"charPrIDRef": ref, "text": combined})
+        # 부모 문단 추적 (linesegarray 제거용)
+        p = run.getparent()
+        while p is not None and etree.QName(p.tag).localname != "p":
+            p = p.getparent()
+        if p is not None:
+            affected_parents.add(p)
+
+    # 영향 받은 문단에서 linesegarray 제거
+    for p in affected_parents:
+        _remove_linesegarray_from_p(p)
+
+    # C단계: 빈 껍질 문단 제거 (스윕된 문단에 ㆍ/공백만 남았으면 문단 통째로 제거)
+    # 표 셀·머리말/꼬리말 등 구조 컨테이너 안쪽 문단은 건드리지 않는다.
+    removed_empty = 0
+    for p in affected_parents:
+        if not _is_bullet_only_paragraph(p, t_tag):
+            continue
+        if _is_inside_protected_container(p):
+            continue
+        parent = p.getparent()
+        if parent is not None:
+            parent.remove(p)
+            removed_empty += 1
+    if removed_empty:
+        report.append({
+            "charPrIDRef": "C-empty",
+            "text": f"[빈 껍질 문단 {removed_empty}개 제거 (ㆍ·공백만 남은 앵커 잔해)]",
+        })
+
+    xml_decl = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    if section_xml_bytes.startswith(b"<?xml"):
+        header_end = section_xml_bytes.index(b"?>") + 2
+        xml_decl = section_xml_bytes[:header_end].decode("utf-8") + "\n"
+
+    body = etree.tostring(root, encoding="unicode", xml_declaration=False)
+    return (xml_decl + body).encode("utf-8"), report
+
+
+def _write_sweep_report(report_path, sweep_reports, long_unmatched=None):
+    """Phase L+ 스윕 + Phase L 미매칭 앵커 리포트를 파일로 저장한다.
+
+    Args:
+        report_path: 리포트 출력 경로
+        sweep_reports: [(filename, [{charPrIDRef, text}, ...])] — 스윕된 run
+        long_unmatched: [(filename, [anchor_text, ...])] — Phase L 미매칭 앵커
+    """
+    lines = ["# Phase L+ / Phase L 결합 리포트", ""]
+
+    # Phase L 미매칭 앵커 (⚠️ 경고) — 팀원이 가장 먼저 봐야 할 항목이라 위쪽 배치
+    unmatched_total = 0
+    if long_unmatched:
+        lines.append("## ⚠️ Phase L 미매칭 앵커 (본문 삽입 실패 — 해당 위치가 빈 공간으로 남음)")
+        lines.append("")
+        lines.append("아래 앵커들은 long_map에 정의되어 있으나 양식 XML에서 일치하는 텍스트를 찾지 못해 본문이 삽입되지 않았습니다.")
+        lines.append("Phase L+가 빨간 가이드를 지웠다면 **해당 자리가 비어 있을 수 있습니다.**")
+        lines.append("long_map 앵커를 양식 실제 가이드 텍스트와 정확히 일치시켜 재출력하세요.")
+        lines.append("")
+        for filename, anchors in long_unmatched:
+            if not anchors:
+                continue
+            lines.append(f"### {filename} — {len(anchors)}건 미매칭")
+            lines.append("")
+            for i, anchor in enumerate(anchors, 1):
+                shown = anchor if len(anchor) <= 120 else anchor[:120] + "…"
+                lines.append(f"{i}. {shown}")
+                unmatched_total += 1
+            lines.append("")
+
+    # Phase L+ 스윕 로그
+    sweep_total = 0
+    lines.append("## Phase L+ 빨간 가이드 스윕 (#FF0000 run 삭제)")
+    lines.append("")
+    for filename, entries in (sweep_reports or []):
+        if not entries:
+            continue
+        lines.append(f"### {filename} — {len(entries)}건 삭제")
+        lines.append("")
+        for i, e in enumerate(entries, 1):
+            text = e["text"]
+            if len(text) > 120:
+                text = text[:120] + "…"
+            lines.append(f"{i}. [charPr {e['charPrIDRef']}] {text}")
+            sweep_total += 1
+        lines.append("")
+
+    # 요약 헤더 삽입
+    summary = [f"총 삭제 run: {sweep_total}건 / Phase L 미매칭 앵커: {unmatched_total}건", ""]
+    if unmatched_total > 0:
+        summary.insert(0, "⚠️ 본문 삽입 실패 앵커가 있습니다. 파일 열기 전에 아래 '미매칭 앵커' 섹션을 먼저 확인하세요.")
+        summary.insert(1, "")
+    lines[1:1] = summary
+
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +791,9 @@ def _apply_keywords_in_xml(xml_text, sorted_keywords):
 
 
 def clone(src_path, dst_path, replacements=None, keywords=None,
-          long_map=None, title=None, creator=None):
+          long_map=None, title=None, creator=None,
+          sweep_red_guides=True, sweep_allow_texts=None,
+          sweep_report_path=None):
     """HWPX 양식을 복제하고 텍스트를 치환한다.
 
     Args:
@@ -582,11 +804,29 @@ def clone(src_path, dst_path, replacements=None, keywords=None,
         long_map: Phase L 장문 삽입 dict (섹션제목 → 문단 리스트)
         title: 문서 제목 (메타데이터)
         creator: 작성자 (메타데이터)
+        sweep_red_guides: Phase L+ 빨간 가이드 스윕 활성 여부 (기본 True)
+        sweep_allow_texts: 삭제 예외 문자열 리스트 (본문 강조용 빨간 텍스트)
+        sweep_report_path: 삭제 리포트 저장 경로 (None이면 dst_path 옆에 자동 생성)
     """
     replacements = replacements or {}
     sorted_keywords = _prepare_keywords(keywords) if keywords else []
 
     tmp_path = dst_path + ".tmp"
+
+    # Phase L+ 사전 준비: header.xml에서 빨간 charPr id 수집
+    red_char_pr_ids = set()
+    if sweep_red_guides:
+        try:
+            with zipfile.ZipFile(src_path, "r") as zin_peek:
+                header_bytes = zin_peek.read("Contents/header.xml")
+            red_char_pr_ids = _collect_red_char_pr_ids(header_bytes)
+        except (KeyError, zipfile.BadZipFile):
+            red_char_pr_ids = set()
+        if red_char_pr_ids:
+            print(f"  Phase L+ 빨간 charPr id: {sorted(red_char_pr_ids)}")
+
+    sweep_log_by_file = []  # [(filename, [entries])]
+    long_unmatched_by_file = []  # [(filename, [anchor_text,...])]
 
     with zipfile.ZipFile(src_path, "r") as zin:
         with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zout:
@@ -606,9 +846,26 @@ def clone(src_path, dst_path, replacements=None, keywords=None,
 
                     # Phase L: 장문 삽입 (lxml 문단 분할)
                     if long_map and item.filename.startswith("Contents/section"):
-                        text, count = _apply_long_map(text, long_map)
+                        text, count, per_anchor = _apply_long_map(text, long_map)
                         if count > 0:
                             print(f"  Phase L 합계: {count}개 문단 삽입 ({item.filename})")
+                        # 미매칭 앵커 수집
+                        unmatched = [a for a, c in per_anchor.items() if c == 0]
+                        if unmatched:
+                            print(f"  Phase L 미매칭 앵커: {len(unmatched)}건 ({item.filename})")
+                            long_unmatched_by_file.append((item.filename, unmatched))
+
+                    # Phase L+: 빨간 가이드 스윕 (section만)
+                    if (sweep_red_guides and red_char_pr_ids
+                            and item.filename.startswith("Contents/section")):
+                        xml_bytes = text.encode("utf-8")
+                        swept, entries = _sweep_red_guides(
+                            xml_bytes, red_char_pr_ids, sweep_allow_texts
+                        )
+                        if entries:
+                            text = swept.decode("utf-8")
+                            sweep_log_by_file.append((item.filename, entries))
+                            print(f"  Phase L+ 가이드 삭제: {len(entries)}건 ({item.filename})")
 
                     # Phase 3: linesegarray 제거 (텍스트 치환 후 줄 배치 캐시 무효화 방지)
                     if replacements or sorted_keywords:
@@ -638,6 +895,19 @@ def clone(src_path, dst_path, replacements=None, keywords=None,
                     zout.writestr(item, data)
 
     os.replace(tmp_path, dst_path)
+
+    # Phase L+ / Phase L 미매칭 리포트 저장 (둘 중 하나라도 있으면 생성)
+    if sweep_log_by_file or long_unmatched_by_file:
+        if sweep_report_path is None:
+            base, _ = os.path.splitext(dst_path)
+            sweep_report_path = base + "_guide_sweep_report.txt"
+        _write_sweep_report(sweep_report_path, sweep_log_by_file,
+                            long_unmatched=long_unmatched_by_file)
+        total_unmatched = sum(len(a) for _, a in long_unmatched_by_file)
+        if total_unmatched > 0:
+            print(f"  [WARN] Phase L 미매칭 앵커 {total_unmatched}건 -- 리포트: {sweep_report_path}")
+        else:
+            print(f"  Phase L+ 리포트: {sweep_report_path}")
 
 
 def validate_result(src_path, dst_path, replacements=None, keywords=None):
@@ -723,6 +993,10 @@ def main():
     parser.add_argument("--validate", action="store_true", help="치환 후 검증 실행")
     parser.add_argument("--check-typos", action="store_true",
                         help="결과 HWPX 오타 검수 (출력 파일 또는 source 대상)")
+    parser.add_argument("--no-sweep-red", action="store_true",
+                        help="Phase L+ 빨간 가이드 스윕 비활성 (기본: 활성)")
+    parser.add_argument("--sweep-allow", nargs="*", default=None,
+                        help="Phase L+에서 삭제하지 않을 빨간 텍스트 예외 (본문 강조용)")
 
     args = parser.parse_args()
 
@@ -780,7 +1054,9 @@ def main():
 
     # 복제 실행
     clone(args.source, args.output, replacements, keywords,
-          long_map=long_map, title=args.title, creator=args.creator)
+          long_map=long_map, title=args.title, creator=args.creator,
+          sweep_red_guides=not args.no_sweep_red,
+          sweep_allow_texts=args.sweep_allow)
     print(f"복제 완료: {args.output}")
 
     # 검증
