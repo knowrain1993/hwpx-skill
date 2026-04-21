@@ -274,7 +274,21 @@ def _get_section_range(parent, title_p):
     return title_idx, end_idx
 
 
-def _insert_long_text(root, target_text, paragraphs, after_section_title=None):
+def _mark_phase_l_inserted(run, red_char_pr_id=None):
+    """Phase L이 삽입한 run에 빨간 charPr 교체 + replaced="L" 마커를 붙인다.
+
+    운영자가 한글에서 열었을 때 빨간색=검토/수정 대상, 검정색=양식 원본으로
+    즉시 구별 가능. Phase L+ 스윕은 replaced="L" 마커를 보고 이 run을 건너뛴다.
+    """
+    if run is None:
+        return
+    run.set("replaced", "L")
+    if red_char_pr_id:
+        run.set("charPrIDRef", red_char_pr_id)
+
+
+def _insert_long_text(root, target_text, paragraphs, after_section_title=None,
+                      red_char_pr_id=None):
     """target_text를 포함하는 <hp:p>를 찾아 paragraphs 목록으로 교체한다.
 
     양식의 <hp:p> 스타일(paraPrIDRef, charPrIDRef)을 그대로 복제하므로
@@ -329,6 +343,8 @@ def _insert_long_text(root, target_text, paragraphs, after_section_title=None):
     for i in range(use_count):
         p_elem, t_elem = matches[i]
         t_elem.text = "  " + paragraphs[i] + " "
+        # 삽입 본문 마킹 — 운영자 검토 표시용 빨간색 + Phase L+ skip
+        _mark_phase_l_inserted(t_elem.getparent(), red_char_pr_id)
         _remove_linesegarray_from_p(p_elem)
 
     # 문단이 플레이스홀더보다 많으면 → 마지막 매칭 <hp:p>를 복제하여 추가
@@ -342,6 +358,7 @@ def _insert_long_text(root, target_text, paragraphs, after_section_title=None):
             for t in new_p.iter():
                 if etree.QName(t.tag).localname == "t":
                     t.text = "  " + txt + " "
+                    _mark_phase_l_inserted(t.getparent(), red_char_pr_id)
                     break
             _remove_linesegarray_from_p(new_p)
 
@@ -392,7 +409,7 @@ def _insert_long_text(root, target_text, paragraphs, after_section_title=None):
     return len(paragraphs)
 
 
-def _apply_long_map(xml_bytes, long_map):
+def _apply_long_map(xml_bytes, long_map, red_char_pr_id=None):
     """Phase L: 장문 치환 맵을 lxml로 적용한다.
 
     long_map 형식:
@@ -432,7 +449,8 @@ def _apply_long_map(xml_bytes, long_map):
             paragraphs = config.get("paragraphs", [])
 
         count = _insert_long_text(root, placeholder, paragraphs,
-                                  after_section_title=section_title)
+                                  after_section_title=section_title,
+                                  red_char_pr_id=red_char_pr_id)
         if count > 0:
             print(f"  Phase L: [{section_title}] {count}개 문단 삽입")
         total_inserted += count
@@ -551,6 +569,9 @@ def _sweep_red_guides(section_xml_bytes, red_ids, allow_texts=None):
         ref = run.get("charPrIDRef")
         if ref not in red_ids:
             continue
+        # Phase L이 삽입한 본문(replaced="L")은 스윕 제외 — 운영자 검토 대상 빨간 표시
+        if run.get("replaced") == "L":
+            continue
         # 이 run 안의 모든 <hh:t> 수집
         t_elements = list(run.iter(t_tag))
         if not t_elements:
@@ -620,7 +641,11 @@ def _write_sweep_report(report_path, sweep_reports, long_unmatched=None):
         lines.append("")
         lines.append("아래 앵커들은 long_map에 정의되어 있으나 양식 XML에서 일치하는 텍스트를 찾지 못해 본문이 삽입되지 않았습니다.")
         lines.append("Phase L+가 빨간 가이드를 지웠다면 **해당 자리가 비어 있을 수 있습니다.**")
-        lines.append("long_map 앵커를 양식 실제 가이드 텍스트와 정확히 일치시켜 재출력하세요.")
+        lines.append("")
+        lines.append("**대응 가이드**:")
+        lines.append("1. 앵커가 **표 셀 내부**면 자동화 제외 대상입니다. 한글에서 해당 셀에 HTML 원고 내용을 복붙하세요. (표 셀 내부 구조는 셀 몰림·스타일 오염 등 부작용 때문에 자동화하지 않습니다.)")
+        lines.append("2. 앵커가 **노란 박스 내부**면 map.json(Phase 1)으로 가이드 문구 자체를 본문으로 직접 치환하세요.")
+        lines.append("3. 앵커가 표/박스 밖 순수 본문인데 매칭 실패면 — long_map 앵커 문자열을 양식 실제 가이드 텍스트(아래 '스윕' 섹션)와 정확히 일치시켜 재출력하세요.")
         lines.append("")
         for filename, anchors in long_unmatched:
             if not anchors:
@@ -846,7 +871,12 @@ def clone(src_path, dst_path, replacements=None, keywords=None,
 
                     # Phase L: 장문 삽입 (lxml 문단 분할)
                     if long_map and item.filename.startswith("Contents/section"):
-                        text, count, per_anchor = _apply_long_map(text, long_map)
+                        # 빨간 charPr id 중 하나를 "삽입 본문 검토용 빨간 표시"로 선택
+                        # (Phase L+ 스윕은 replaced="L" 마커 덕에 건너뜀)
+                        review_char_pr_id = (sorted(red_char_pr_ids)[0]
+                                             if red_char_pr_ids else None)
+                        text, count, per_anchor = _apply_long_map(
+                            text, long_map, red_char_pr_id=review_char_pr_id)
                         if count > 0:
                             print(f"  Phase L 합계: {count}개 문단 삽입 ({item.filename})")
                         # 미매칭 앵커 수집
